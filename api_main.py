@@ -6,6 +6,7 @@ import cv2
 import tempfile
 import os
 import heat_map
+import logging
 
 app = FastAPI()
 
@@ -13,34 +14,35 @@ app = FastAPI()
 MAX_JSON_SIZE = 15_000_000  # 15MB
 MAX_IMAGE_SIZE = 5_000_000  # 5MB
 
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.DEBUG)
+
 def process_uploaded_files(image_file: UploadFile, json_file: UploadFile):
     """Handle file processing with proper cleanup"""
     # Check file sizes first before processing
     json_content = json_file.file.read()
+    logger.debug(f"JSON content length: {len(json_content)} bytes")
     if len(json_content) > MAX_JSON_SIZE:
         raise ValueError(f"JSON file too large (max {MAX_JSON_SIZE} bytes allowed)")
-
     image_data = image_file.file.read()
+    logger.debug(f"Image data length: {len(image_data)} bytes")
     if len(image_data) > MAX_IMAGE_SIZE:
         raise ValueError(f"Image file too large (max {MAX_IMAGE_SIZE} bytes allowed)")
-
     # Process image file
     nparr = np.frombuffer(image_data, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    logger.debug(f"Decoded image shape: {img.shape if img is not None else 'None'}")
     if img is None:
         raise ValueError("Invalid image file")
-    img = cv2.resize(img, (708, 480))
-
     # Process JSON file
     with tempfile.NamedTemporaryFile(delete=False, suffix='.json') as temp_json:
         temp_json.write(json_content)
         temp_json_path = temp_json.name
-    
     try:
         detections = heat_map.parse_geojson(temp_json_path)
+        logger.debug(f"Detections found: {len(detections)}")
     finally:
         os.unlink(temp_json_path)
-
     return img, detections
 
 @app.post("/generate-overlay")
@@ -63,30 +65,28 @@ async def generate_heatmap_overlay(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="JSON file required"
             )
-
         # Process uploaded files
         try:
             img, detections = process_uploaded_files(image, json_data)
         except ValueError as e:
+            logger.error(f"ValueError in process_uploaded_files: {e}")
             if "too large" in str(e).lower():
                 raise HTTPException(
                     status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                     detail=str(e)
                 )
             raise
-
         if len(detections) == 0:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="No person detections found in JSON data"
             )
-
         # Generate heatmap overlay
-        heatmap = heat_map.generate_heatmap(detections, 708, 480)
+        heatmap = heat_map.generate_heatmap(detections, img.shape[1], img.shape[0])
+        logger.debug(f"Heatmap shape: {heatmap.shape}")
         colormap = heat_map.create_custom_colormap()
         heatmap_rgba = heat_map.apply_custom_colormap(heatmap, colormap)
         result_image = heat_map.overlay_heatmap(img, heatmap_rgba)
-
         # Encode response
         _, encoded_img = cv2.imencode(".png", result_image)
         return Response(
@@ -94,10 +94,10 @@ async def generate_heatmap_overlay(
             media_type="image/png",
             headers={"Content-Disposition": "attachment; filename=overlay.png"}
         )
-
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"Uncaught exception in generate_heatmap_overlay: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Processing error: {str(e)}"
